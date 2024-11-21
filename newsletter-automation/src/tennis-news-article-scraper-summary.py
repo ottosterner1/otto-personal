@@ -1,131 +1,212 @@
-import requests
-from urllib.parse import urljoin, urlparse
-from datetime import datetime, timedelta
-import json
 import os
-from typing import List, Dict
-import mailchimp_marketing as MailchimpMarketing
-from mailchimp_marketing.api_client import ApiClientError
-from newspaper import Article
+import requests
 from bs4 import BeautifulSoup
+from typing import List, Dict
+import google.generativeai as genai
+import pandas as pd
+import json
+import traceback
+import re
 
-class TennisNewsletterAutomator:
-    def __init__(self, mailchimp_api_key: str = None, mailchimp_list_id: str = None):
-        """Initialize with optional Mailchimp credentials"""
-        if mailchimp_api_key and mailchimp_list_id:
-            self.mailchimp = MailchimpMarketing.Client()
-            self.mailchimp.set_config({
-                "api_key": mailchimp_api_key,
-                "server": mailchimp_api_key.split('-')[-1]
-            })
-            self.list_id = mailchimp_list_id
-        else:
-            self.mailchimp = None
-            self.list_id = None
+def estimate_reading_time(text: str) -> int:
+    """
+    Estimate reading time based on word count
+    Average reading speed is around 250 words per minute
+    
+    :param text: Article text
+    :return: Estimated reading time in minutes
+    """
+    # Remove extra whitespace and split into words
+    words = re.findall(r'\w+', text)
+    word_count = len(words)
+    reading_time = max(1, round(word_count / 250))
+    return reading_time
 
-    def fetch_tennis_news(self, days_back: int = 14) -> List[Dict]:
+class ArticleSummarizer:
+    def __init__(self, gemini_api_key: str):
         """
-        Fetch recent tennis news from multiple sources
-        Returns list of articles with title, url, summary, and source
-        """
-        # Define more robust sources with base URLs
-        sources = [
-            {
-                "base_url": "https://www.atptour.com",
-                "news_url": "https://www.atptour.com/en/news/",
-                "article_selector": "a.article-item"
-            },
-            {
-                "base_url": "https://www.wtatennis.com",
-                "news_url": "https://www.wtatennis.com/news",
-                "article_selector": "a.article-link"
-            }
-        ]
+        Initialize the article summarizer with Gemini API
         
-        articles = []
-        for source in sources:
-            try:
-                response = requests.get(source['news_url'])
-                soup = BeautifulSoup(response.content, 'html.parser')
-                
-                # Find article links
-                article_links = soup.select(source['article_selector'])
-                
-                for link in article_links[:5]:  # Limit to 5 articles per source
-                    # Construct full URL
-                    href = link.get('href', '')
-                    full_url = urljoin(source['base_url'], href)
-                    
-                    try:
-                        article = Article(full_url)
-                        article.download()
-                        article.parse()
-                        article.nlp()  # Generate summary
-                        
-                        articles.append({
-                            'title': article.title,
-                            'url': full_url,
-                            'summary': article.summary,
-                            'source': source['base_url'],
-                            'date': article.publish_date or datetime.now()
-                        })
-                    except Exception as article_error:
-                        print(f"Error processing article {full_url}: {article_error}")
-                
-            except Exception as e:
-                print(f"Error fetching from {source['news_url']}: {str(e)}")
-                
-        return articles
+        :param gemini_api_key: Google Gemini API key
+        """
+        # Configure Gemini API
+        genai.configure(api_key=gemini_api_key)
+        self.model = genai.GenerativeModel('gemini-1.5-flash')
 
-    def generate_newsletter_draft(self, articles: List[Dict]) -> str:
+    def extract_article_content(self, url: str) -> Dict:
         """
-        Generate HTML content for newsletter from articles
+        Extract article content using requests and BeautifulSoup
+        
+        :param url: URL of the article
+        :return: Dictionary with article details
         """
-        html_content = f"""
-        <html>
-        <body>
-            <h1>Tennis News Roundup</h1>
-            <p>Latest tennis stories from {datetime.now().strftime('%B %d, %Y')}:</p>
+        try:
+            # Use a user agent to mimic a browser
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
             
-            {''.join([f"""
-            <div style="margin-bottom: 20px; border-bottom: 1px solid #ccc;">
-                <h2><a href="{article['url']}">{article['title']}</a></h2>
-                <p><em>Source: {article['source']}</em></p>
-                <p>{article['summary']}</p>
-            </div>
-            """ for article in articles])}
-        </body>
-        </html>
-        """
+            # Fetch the page
+            response = requests.get(url, headers=headers)
             
-        return html_content
+            # Check if request was successful
+            if response.status_code != 200:
+                print(f"Failed to retrieve {url}. Status code: {response.status_code}")
+                return None
+            
+            # Parse with BeautifulSoup
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Extract title
+            title = soup.find('h1')
+            title = title.text.strip() if title else 'No Title'
+            
+            # Extract main content (this will vary by website)
+            # For BBC, you might need to inspect the specific article page structure
+            content_paragraphs = soup.find_all(['p', 'article'])
+            
+            # Combine text from paragraphs
+            text = ' '.join([p.get_text().strip() for p in content_paragraphs if p.get_text().strip()])
+            
+            # Check if text is empty
+            if not text:
+                print(f"No text extracted from {url}")
+                return None
+            
+            # Estimate reading time
+            reading_time = estimate_reading_time(text)
+            
+            return {
+                'url': url,
+                'title': title,
+                'text': text,
+                'reading_time': reading_time,
+                'source': url.split('/')[2]  # Extract domain
+            }
+        
+        except Exception as e:
+            print(f"Error extracting {url}:")
+            print(traceback.format_exc())
+            return None
 
-    def print_articles(self, articles: List[Dict]):
+    def summarize_with_gemini(self, article_text: str, custom_title: str = None) -> str:
         """
-        Print articles to console for verification
+        Summarize article text using Gemini API
+        
+        :param article_text: Full text of the article
+        :param custom_title: Optional custom title provided by user
+        :return: Concise summary
         """
-        for article in articles:
-            print(f"Title: {article['title']}")
-            print(f"URL: {article['url']}")
-            print(f"Summary: {article['summary'][:200]}...")
-            print("---")
+        try:
+            # Truncate very long articles
+            max_tokens = 10000
+            truncated_text = article_text[:max_tokens]
+            
+            # Incorporate custom title if provided
+            title_context = f"Article Title: {custom_title}" if custom_title else ""
+            
+            prompt = f"""{title_context}
+            Please provide a summary of the following article text for my tennis newsletter. 
+            The summary should be no more than 1 paragraph and around 3-4 sentences, capturing the key points and main message. Here is an example summary:
+
+            British number one Katie Boulter will climb into the world's top 25 for the first time after reaching the final of the Hong Kong Open. She eventually lost in the final to Russian top seed Diana Shnaider 6-2 6-1 and missed out on a third WTA title of the year. Boulter is next set to represent Great Britain at the Billie Jean King Cup Finals on 15 November.
+
+            Article text: 
+            {truncated_text}
+            """
+            
+            response = self.model.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            print(f"Summarization error: {e}")
+            print(traceback.format_exc())
+            return "Unable to generate summary"
+
+    def process_urls(self, urls: List[str], custom_titles: List[str] = None) -> List[Dict]:
+        """
+        Process multiple URLs and generate summaries
+        
+        :param urls: List of article URLs
+        :param custom_titles: Optional list of custom titles
+        :return: List of summarized articles
+        """
+        summarized_articles = []
+        
+        # If no custom titles provided, use None for each URL
+        if custom_titles is None:
+            custom_titles = [None] * len(urls)
+        
+        for url, custom_title in zip(urls, custom_titles):
+            # Extract article content
+            article_details = self.extract_article_content(url)
+            
+            if article_details and article_details['text']:
+                # Generate summary with optional custom title
+                summary = self.summarize_with_gemini(article_details['text'], custom_title)
+                
+                # Combine details with summary
+                article_details['summary'] = summary
+                summarized_articles.append(article_details)
+            else:
+                print(f"Could not extract content from {url}")
+        
+        return summarized_articles
+
+    def save_to_mailchimp_format(self, articles: List[Dict], filename: str = 'mailchimp_article_summaries.txt'):
+        """
+        Save summarized articles in a format easy to copy-paste into Mailchimp
+        
+        :param articles: List of article dictionaries
+        :param filename: Output text filename
+        """
+        with open(filename, 'w', encoding='utf-8') as f:
+            for article in articles:
+                f.write(f"Title: {article['title']}\n")
+                f.write(f"Summary: {article['summary']}\n")
+                f.write(f"Reading Time: {article['reading_time']} min\n")
+                f.write(f"Full Article: {article['url']}\n\n")
+        
+        print(f"Saved {len(articles)} articles to {filename}")
+        
+        # Also print to console for immediate review
+        with open(filename, 'r', encoding='utf-8') as f:
+            print(f.read())
 
 def main():
-    # No Mailchimp credentials required for initial testing
-    automator = TennisNewsletterAutomator()
+    # Replace with your actual Gemini API key
+    GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'AIzaSyBrss_ENXnmWFSZR3v17HBjbFXlzYrfXUE')
     
-    # Fetch recent tennis news
-    articles = automator.fetch_tennis_news()
+    # Prompt user for URLs
+    print("Enter article URLs (press Enter without typing to finish):")
+    urls_to_scrape = [
+        'https://www.bbc.co.uk/sport/tennis/articles/c8rl1671z7jo'
+    ]
+    titles = [
+        ''
+    ]
     
-    # Print articles to verify
-    automator.print_articles(articles)
+    while True:
+        url = input("URL: ").strip()
+        if not url:
+            break
+        
+        # Optional custom title input
+        title = input("Custom Title (optional, press Enter to skip): ").strip() or None
+        
+        urls_to_scrape.append(url)
+        titles.append(title)
     
-    # Optional: Generate HTML draft
-    html_content = automator.generate_newsletter_draft(articles)
+    # Initialize summarizer
+    summarizer = ArticleSummarizer(GEMINI_API_KEY)
     
-    # Optionally save HTML to file
-    with open('newsletter_draft.html', 'w') as f:
-        f.write(html_content)
+    # Process URLs
+    summarized_articles = summarizer.process_urls(urls_to_scrape, titles)
+    
+    # Save results
+    if summarized_articles:
+        summarizer.save_to_mailchimp_format(summarized_articles)
+    else:
+        print("No articles were successfully processed.")
 
 if __name__ == "__main__":
     main()
